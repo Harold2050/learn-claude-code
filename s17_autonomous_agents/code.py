@@ -283,35 +283,53 @@ def match_response(response_type: str, request_id: str, approve: bool):
           f"({request_id}: {state.status})\033[0m")
 
 
-# ── Autonomous Agent (s17 new) ──
+# ═══════════════════════════════════════════════════════════
+#  NEW in s17: Autonomous Agent — 自组织(无需 Leader 分配)
+#  ★ s16 的 teammate 等 Lead 发任务才干活。s17 的 teammate 会自己找活干:
+#    闲下来时扫描任务板(scan_unclaimed_tasks)，发现能做的就自动认领。
+#    这叫"自组织"——Leader 不用一个个分配，teammate 自己从看板抢任务。
+# ═══════════════════════════════════════════════════════════
 
 IDLE_POLL_INTERVAL = 5   # seconds
+# ↑ idle 轮询间隔: 每 5 秒检查一次(邮箱/任务板)。
 IDLE_TIMEOUT = 60         # seconds
+# ↑ idle 超时: 60 秒没活干就退出(节省资源)。60/5=12 次轮询。
 
 
 def scan_unclaimed_tasks() -> list[dict]:
+    # ★★★ s17 核心: 扫描任务板，找"无主 + 依赖完成"的 pending 任务。
+    #   这就是自组织的眼睛——teammate 用它发现能干的活。
     """Find pending, unowned tasks with all dependencies completed."""
     unclaimed = []
     for f in sorted(TASKS_DIR.glob("task_*.json")):
+        # ↑ 遍历 .tasks/ 下所有任务文件(sorted 排序详见 s12)。
         task = json.loads(f.read_text())
         if (task.get("status") == "pending"
                 and not task.get("owner")
                 and can_start(task["id"])):
+            # ↑ 三个条件: pending(待办) + 无 owner(没人认领) + 依赖全完成(can_start)。
             unclaimed.append(task)
     return unclaimed
 
 
 def idle_poll(name: str, messages: list, role: str) -> str:
+    # ★★★★ s17 核心: teammate 空闲时的轮询循环。
+    #   返回 "work"(找到活)/"shutdown"(被要求关闭)/"timeout"(超时退出)。
+    #   三种唤醒源: 邮箱消息 / 任务板未认领任务 / 协议关闭请求。
     """Poll for 60s. Return 'work', 'shutdown', or 'timeout'."""
     for _ in range(IDLE_TIMEOUT // IDLE_POLL_INTERVAL):
+        # ↑ range(60 // 5) = range(12): 最多轮询 12 次(60秒)。// 是整除。
         time.sleep(IDLE_POLL_INTERVAL)
+        # ↑ 等 5 秒(防 CPU 空转)。
 
         # Check inbox — dispatch protocol messages first
         inbox = BUS.read_inbox(name)
+        # ↑ 读邮箱(读即销毁)。
         if inbox:
             # Check for shutdown_request
             for msg in inbox:
                 if msg.get("type") == "shutdown_request":
+                    # ↑ 收到关闭请求 → 回复 shutdown_response，返回 "shutdown"。
                     req_id = msg.get("metadata", {}).get("request_id", "")
                     BUS.send(name, "lead", "Shutting down gracefully.",
                              "shutdown_response",
@@ -325,24 +343,33 @@ def idle_poll(name: str, messages: list, role: str) -> str:
                 "content": "<inbox>" + json.dumps(inbox) + "</inbox>"})
             print(f"  \033[36m[idle] {name} found inbox messages\033[0m")
             return "work"
+            # ↑ 有普通消息(新任务/指令)→ 注入对话，返回 "work"(继续干活)。
 
         # Scan task board
         unclaimed = scan_unclaimed_tasks()
+        # ↑ ★ 扫描任务板找未认领的任务。
         if unclaimed:
             task = unclaimed[0]
+            # ↑ 教学版取第一个(可改进: 按能力/优先级挑)。
             result = claim_task(task["id"], name)
+            # ↑ ★ 自动认领(claim_task 详见 s12)。owner 设为 teammate 名字。
             if "Claimed" in result:
+                # ↑ "Claimed" in result: 检查返回值是否含 "Claimed"(成功认领)。
+                #   in 对字符串是子串匹配(详见 s02)。
                 messages.append({"role": "user",
                     "content": f"<auto-claimed>Task {task['id']}: "
                                f"{task['subject']}</auto-claimed>"})
                 print(f"  \033[32m[idle] {name} auto-claimed: "
                       f"{task['subject']}\033[0m")
                 return "work"
+                # ↑ 认领成功 → 注入任务信息，返回 "work"。
             print(f"  \033[33m[idle] {name} claim failed: "
                   f"{result}\033[0m")
+            # ↑ 认领失败(可能被别的 teammate 抢了)→ 继续轮询。
 
     print(f"  \033[31m[idle] {name} timeout ({IDLE_TIMEOUT}s)\033[0m")
     return "timeout"
+    # ↑ 60 秒没找到活 → 返回 "timeout"(teammate 退出)。
 
 
 # ── Teammate Thread (from s15 + s16 + s17) ──

@@ -366,35 +366,64 @@ class MessageBus:
 BUS = MessageBus()
 active_teammates: dict[str, bool] = {}
 
-# ── Protocol State (s16 new) ──
+# ═══════════════════════════════════════════════════════════
+#  NEW in s16: Protocol State Machine
+#  ★ 本章灵魂: 给 agent 之间的通信加上"请求-响应"协议。
+#    s15 的消息是"发了就忘"(fire-and-forget)。s16 给每条请求分配 request_id，
+#    响应靠 request_id 关联回原请求，并校验类型匹配 + 防重复处理。
+#    两种协议: shutdown(优雅关闭握手)、plan_approval(计划审批)。
+# ═══════════════════════════════════════════════════════════
 
 @dataclass
 class ProtocolState:
+    # ★★★ s16 核心新增: 协议状态类。跟踪一个"请求"从发出到被响应的全过程。
+    #   状态机: pending(待处理) → approved(批准) / rejected(拒绝)。
     request_id: str
+    # ↑ 请求唯一 ID(如 "req_000123")。响应用它关联回原请求。
     type: str       # "shutdown" | "plan_approval"
+    # ↑ 协议类型: shutdown=关闭握手，plan_approval=计划审批。
     sender: str
+    # ↑ 发起方(如 "lead" 或 teammate 名字)。
     target: str
+    # ↑ 接收方。
     status: str     # pending | approved | rejected
+    # ↑ 当前状态: pending(等待响应)/approved(已批准)/rejected(已拒绝)。
     payload: str    # plan text or shutdown reason
+    # ↑ 载荷: plan_approval 时是计划文本；shutdown 时是原因。
     created_at: float = field(default_factory=time.time)
+    # ↑ ★ 创建时间戳。field(default_factory=time.time) 是 dataclass 的特殊写法:
+    #   default_factory=time.time 表示"默认值由调用 time.time() 生成"。
+    #   为什么不直接写 = time.time()? 因为那样会在【类定义时】求值一次(所有实例共享同一时间)。
+    #   default_factory 在【每个实例创建时】才调用 time.time()(各自有独立时间)。
 
 
 pending_requests: dict[str, ProtocolState] = {}
+# ↑ ★ 进行中的协议请求表: request_id → ProtocolState。
+#   Lead 发出请求时存进来，收到响应时查这里关联。
 
 
 def new_request_id() -> str:
+    # ★ 生成唯一请求 ID。
     return f"req_{random.randint(0, 999999):06d}"
+    # ↑ "req_" + 6位随机数。:06d 详见 s12(不足6位补零)。
 
 
 def match_response(response_type: str, request_id: str, approve: bool):
+    # ★★★ s16 核心: 把响应关联回原请求(靠 request_id)+ 校验类型 + 更新状态。
+    #   response_type: 响应消息的类型(如 "shutdown_response")。
+    #   approve: 是否批准(True=批准，False=拒绝)。
     """Correlate a response to the original request via request_id.
     Validates that response_type matches the request type."""
     state = pending_requests.get(request_id)
+    # ↑ 用 request_id 查原请求。dict.get 详见 s02(不存在返回 None)。
     if not state:
         print(f"  \033[31m[protocol] unknown request_id: {request_id}\033[0m")
         return
+        # ↑ 找不到原请求(可能是伪造/过期的 request_id)，忽略。
     # Validate response type matches request type
     if state.type == "shutdown" and response_type != "shutdown_response":
+        # ★ 类型校验: shutdown 请求只能配 shutdown_response。
+        #   防止"plan 的响应错关到 shutdown 请求"这类错配。
         print(f"  \033[31m[protocol] type mismatch: expected shutdown_response, "
               f"got {response_type}\033[0m")
         return
@@ -403,41 +432,60 @@ def match_response(response_type: str, request_id: str, approve: bool):
               f"got {response_type}\033[0m")
         return
     if state.status != "pending":
+        # ★ 幂等保护: 已经处理过的请求不重复处理(防重复响应)。
         print(f"  \033[33m[protocol] {request_id} already {state.status}, "
               f"ignoring duplicate\033[0m")
         return
     state.status = "approved" if approve else "rejected"
+    # ↑ 更新状态(三元表达式详见 s01)。
     icon = "✓" if approve else "✗"
     color = "32" if approve else "31"
+    # ↑ 批准用绿色(32)/✓，拒绝用红色(31)/✗。ANSI 颜色码详见 s01。
     print(f"  \033[{color}m[protocol] {state.type} {icon} "
           f"({request_id}: {state.status})\033[0m")
 
 
-# ── Unified Lead Inbox Consumer (s16 fix) ──
-# Both check_inbox tool and main loop call this function.
-# Protocol responses are routed via match_response before returning.
+# ═══════════════════════════════════════════════════════════
+#  NEW in s16: Unified Lead Inbox Consumer
+#  ★ 统一收件: check_inbox 工具和主循环都调这个，保证协议响应不丢。
+#    协议响应(shutdown_response 等)先路由到 match_response，再返回所有消息。
+# ═══════════════════════════════════════════════════════════
 
 def consume_lead_inbox(route_protocol: bool = True) -> list[dict]:
+    # ★★★ s16 核心: 读 Lead 邮箱 + 路由协议响应。
+    #   为什么统一? s15 的 check_inbox 和主循环各自读邮箱，可能导致协议响应
+    #   被 check_inbox 消费掉而没走 match_response(协议状态没更新)。
+    #   s16 统一入口: 不管谁读，协议响应都先路由。
     """Read Lead's inbox. Route protocol responses, return all messages.
     Called by both run_check_inbox() and main loop to avoid
     messages being consumed without protocol routing."""
     msgs = BUS.read_inbox("lead")
+    # ↑ 读 Lead 邮箱(读即销毁，详见 s15 的 MessageBus.read_inbox)。
     if not msgs:
         return []
     if route_protocol:
         for msg in msgs:
             meta = msg.get("metadata", {})
+            # ↑ s16 的 MessageBus.send 多了 metadata 参数(见上方 class MessageBus)。
             req_id = meta.get("request_id", "")
             msg_type = msg.get("type", "")
             if req_id and msg_type.endswith("_response"):
+                # ★ ★ endswith("_response"): 识别协议响应(shutdown_response/plan_approval_response)。
+                #   有 request_id 且类型以 _response 结尾 → 是协议响应，路由到 match_response。
                 approve = meta.get("approve", False)
                 match_response(msg_type, req_id, approve)
+                # ↑ 关联响应到原请求 + 更新状态。
     return msgs
 
 
 # ── Teammate Thread (s16: idle loop + dispatch) ──
 
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
+    # ★★★ s16 对 s15 的核心改动: teammate 从"10轮硬上限"改成"idle loop"。
+    #   s15: teammate 跑完10轮就退出(可能任务没做完)。
+    #   s16: teammate 任务做完后不退出，而是【等 inbox 消息】(idle)。
+    #        Lead 可以发 shutdown_request 让它优雅关闭，或发新任务让它继续。
+    #   这是真实 CC 的做法(teammate 持续存在直到被关闭)。
     """Spawn a teammate agent in a background thread.
     Uses idle loop: after each LLM turn, waits for inbox messages
     (shutdown_request, new task) instead of exiting."""
@@ -540,28 +588,36 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
             messages.append({"role": "assistant", "content": response.content})
             if response.stop_reason != "tool_use":
+                # ★★★ s16 核心改动: 不调工具 = 任务做完 → 进入 idle 循环【等待】而非退出。
                 # Idle: wait for inbox messages instead of exiting
                 # Real CC sends idle_notification to Lead here
                 while not shutdown_requested:
                     time.sleep(1)
+                    # ↑ 每秒轮询一次邮箱(防止 CPU 空转)。
                     inbox = BUS.read_inbox(name)
+                    # ↑ 读自己邮箱(读即销毁)。
                     if not inbox:
                         continue
+                        # ↑ 没消息，继续等。
                     for msg in inbox:
                         if msg.get("type") in ("shutdown_request", "plan_approval_response"):
+                            # ↑ 协议消息: shutdown 请求或 plan 审批结果 → 分发处理。
                             should_stop = handle_inbox_message(name, msg, messages)
                             if should_stop:
                                 shutdown_requested = True
                                 break
                         else:
                             non_protocol.append(msg)
+                            # ↑ 非协议消息(普通消息/新任务)→ 收集起来注入对话。
                     if shutdown_requested:
                         break
+                        # ↑ 收到 shutdown → 退出 idle 循环。
                     if non_protocol:
                         inbox_json = json.dumps(non_protocol)
                         messages.append({"role": "user",
                             "content": "<inbox>" + inbox_json + "</inbox>"})
                         break  # back to LLM turn with new messages
+                        # ↑ ★ 有新消息 → 注入对话，break 回到外层循环(再次调 LLM 处理新消息)。
 
             # Execute tool calls
             results = []
@@ -596,6 +652,12 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
 
 def _teammate_submit_plan(from_name: str, plan: str) -> str:
+    # ★★★ s16 新增: teammate 提交计划给 Lead 审批。
+    #   创建 plan_approval 协议请求，发到 Lead 邮箱。
+    #   ★ AGENTS.md 强调: plan 审批是【协议级】而非【代码级】gate。
+    #   即: teammate 提交后线程继续跑(不阻塞)，它"可以"继续调 bash/write。
+    #   真正的约束靠模型"等批准再动手"的自觉，代码层不强制阻断工具派发。
+    #   真实 CC 的代码级 gate 要阻塞 teammate 的工具分发直到批准到达。
     """Teammate submits a plan to Lead for approval.
 
     Note: This is a protocol-level request, not a code-level gate.
@@ -610,15 +672,23 @@ def _teammate_submit_plan(from_name: str, plan: str) -> str:
         request_id=req_id, type="plan_approval",
         sender=from_name, target="lead",
         status="pending", payload=plan)
+    # ↑ 创建协议状态(pending)，存进 pending_requests。
     BUS.send(from_name, "lead", plan,
              "plan_approval_request",
              {"request_id": req_id})
+    # ↑ 发计划到 Lead 邮箱(类型 plan_approval_request + metadata 带 request_id)。
     return f"Plan submitted ({req_id}). Waiting for approval..."
 
 
-# ── Lead Protocol Tools (s16 new) ──
+# ═══════════════════════════════════════════════════════════
+#  NEW in s16: Lead Protocol Tools (3个)
+#  ★ Lead 用这些工具发起协议: 请求关闭 / 请求计划 / 审批计划。
+# ═══════════════════════════════════════════════════════════
 
 def run_request_shutdown(teammate: str) -> str:
+    # ★ s16 新工具: Lead 请求 teammate 优雅关闭。
+    #   创建 shutdown 协议请求，发到 teammate 邮箱。
+    #   teammate 收到后回复 shutdown_response，match_response 更新状态。
     req_id = new_request_id()
     pending_requests[req_id] = ProtocolState(
         request_id=req_id, type="shutdown",
@@ -633,6 +703,8 @@ def run_request_shutdown(teammate: str) -> str:
 
 
 def run_request_plan(teammate: str, task: str) -> str:
+    # ★ s16 新工具: Lead 要求 teammate 提交计划。
+    #   注意: 这只是发条普通消息要求 teammate 用 submit_plan。
     """Lead asks a teammate to submit a plan for a task."""
     BUS.send("lead", teammate, f"Please submit a plan for: {task}",
              "message")
@@ -640,15 +712,21 @@ def run_request_plan(teammate: str, task: str) -> str:
 
 
 def run_review_plan(request_id: str, approve: bool, feedback: str = "") -> str:
+    # ★★★ s16 新工具: Lead 审批 teammate 提交的计划。
+    #   查 pending_requests 找到原请求，更新状态，发审批结果给 teammate。
     state = pending_requests.get(request_id)
     if not state:
         return f"Request {request_id} not found"
     if state.status != "pending":
         return f"Request {request_id} already {state.status}"
+        # ↑ 已处理过的不能重复审批(幂等)。
     state.status = "approved" if approve else "rejected"
+    # ↑ 更新协议状态。
     BUS.send("lead", state.sender, feedback or ("Approved" if approve else "Rejected"),
              "plan_approval_response",
              {"request_id": request_id, "approve": approve})
+    # ↑ 发审批结果给 teammate(类型 plan_approval_response + approve 标志)。
+    #   teammate 的 handle_inbox_message 收到后注入"[Plan approved/rejected]"消息。
     icon = "✓" if approve else "✗"
     print(f"  \033[32m[protocol] plan {icon} ({request_id})\033[0m")
     return f"Plan {'approved' if approve else 'rejected'} ({request_id})"

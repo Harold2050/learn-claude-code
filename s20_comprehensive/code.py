@@ -1909,30 +1909,51 @@ def update_context(context: dict, messages: list) -> dict:
 
 # ── Agent Loop ──
 
+# ═══════════════════════════════════════════════════════════
+#  s20 NEW: Integration Layer — 把 s02-s19 的所有机制拼回一个循环
+#  ★ 终点章: 没有新机制，价值在"整合"——所有机制按正确顺序、正确位置拼进循环。
+#  ★ 四个整合函数把各机制串起来:
+#    prepare_context → 压缩管线统一入口(s08)
+#    build_user_content → 工具结果+后台通知合并(s13)
+#    call_llm → 组装提示+退避调用(s10+s11)
+#  ★ agent_loop 是"全副武装"的完整循环(8个阶段，每阶段来自不同章节)。
+# ═══════════════════════════════════════════════════════════
+
 rounds_since_todo = 0
+# ↑ todo nag 计数器(继承 s05)。详见 s05。
 agent_lock = threading.Lock()
+# ↑ agent 执行锁(继承 s14)。防止多个 agent_loop 并发跑。threading.Lock 详见 s13。
 
 
 def prepare_context(messages: list) -> list:
+    # ★ 整合点1: 每轮 LLM 调用前，过一遍压缩管线(s08)。
+    #   每个 LLM turn 都从这里进，统一管理上下文预算。
     # Every LLM turn enters through the same context budget pipeline.
-    messages[:] = tool_result_budget(messages)
-    messages[:] = snip_compact(messages)
-    messages[:] = micro_compact(messages)
+    messages[:] = tool_result_budget(messages)    # L3: persist large results first
+    messages[:] = snip_compact(messages)          # L1: trim middle
+    messages[:] = micro_compact(messages)         # L2: old result placeholders
+    # ↑ messages[:] = ... 原地替换(详见 s08)。三层压缩(便宜的先做)。
     if estimate_size(messages) > CONTEXT_LIMIT:
         messages[:] = compact_history(messages)
+        # ↑ 超 50000 字符 → L4 LLM 摘要(详见 s08)。
     return messages
 
 
 def build_user_content(results: list[dict]) -> list[dict]:
+    # ★ 整合点2: 把"工具结果"和"后台任务完成通知"合并成一条 user 消息。
+    #   两者都是 user 侧内容(详见 s01 的 results 角色)，合并让模型一次看到。
     # Tool results and completed background notifications are both returned to
     # the model as user-side content, matching the tool_result feedback loop.
     content = list(results)
+    # ↑ 复制 results(list(...) 详见 s08)。
     for note in collect_background_results():
+        # ↑ collect_background_results: 收集已完成的后台任务(s13)。
         content.append({"type": "text", "text": note})
     return content
 
 
 def inject_background_notifications(messages: list):
+    # ★ 整合点3: 单独注入后台通知(当本轮没有工具结果时用)。
     notes = collect_background_results()
     if notes:
         messages.append({"role": "user", "content": [
@@ -1941,10 +1962,13 @@ def inject_background_notifications(messages: list):
 
 def call_llm(messages: list, context: dict, tools: list,
              state: RecoveryState, max_tokens: int):
+    # ★ 整合点4: 组装系统提示(s10) + 带重试地调 LLM(s11)。
     system = assemble_system_prompt(context)
+    # ↑ 运行时组装系统提示(s10)，按 context 选段。
     return with_retry(
+        # ↑ with_retry: 指数退避处理 429/529(s11)。
         lambda: client.messages.create(
-            model=state.current_model,
+            model=state.current_model,    # 可能是 fallback 模型(s11 连续529切换)
             system=system,
             messages=messages,
             tools=tools,
@@ -1953,62 +1977,92 @@ def call_llm(messages: list, context: dict, tools: list,
 
 
 def agent_loop(messages: list, context: dict):
+    # ★★★★★ s20 终点: 全副武装的完整循环。所有 s02-s19 机制回到一个 while True。
+    #   8 个阶段(标注来自哪章):
+    #   1. 注入 cron 定时任务(s14)
+    #   2. 注入后台通知(s13)
+    #   3. todo nag 提醒(s05)
+    #   4. 压缩管线(s08)
+    #   5. 调 LLM + 错误恢复(s11)
+    #   6. max_tokens 升级/续写(s11)
+    #   7. 工具执行(hooks s04 + 后台 s13 + 动态分发 s19)
+    #   8. 合并喂回(s13)
+    """Main loop — uses assembled system prompt instead of hardcoded SYSTEM."""
     global rounds_since_todo
     tools, handlers = assemble_tool_pool()
+    # ↑ ★ 动态工具池(s19): 内置 + 所有已连 MCP 工具，每轮重新组装。
     state = RecoveryState()
+    # ↑ 错误恢复状态(s11): 跟踪升级/续写/529/模型。
     max_tokens = DEFAULT_MAX_TOKENS
 
     while True:
         # One cycle: inject scheduled/background work, prepare context, call
         # the model, execute tool_use blocks, append tool_results, repeat.
+
+        # ── 阶段1: 注入 cron 定时任务(s14) ──
         fired = consume_cron_queue()
+        # ↑ 消费 cron 队列(s14): 到点的定时任务。
         for job in fired:
             messages.append({"role": "user",
                              "content": f"[Scheduled] {job.prompt}"})
             print(f"  \033[35m[cron inject] {job.prompt[:60]}\033[0m")
 
+        # ── 阶段2: 注入后台任务完成通知(s13) ──
         inject_background_notifications(messages)
 
+        # ── 阶段3: todo nag(s05) ──
         if rounds_since_todo >= 3:
+            # ↑ 3 轮没更新 todo → 提醒(s05)。
             messages.append({"role": "user",
                              "content": "<reminder>Update your todos.</reminder>"})
             rounds_since_todo = 0
 
+        # ── 阶段4: 压缩管线(s08) ──
         prepare_context(messages)
         context = update_context(context, messages)
         tools, handlers = assemble_tool_pool()
+        # ↑ ★ 工具池可能变了(connect_mcp 新连了服务器)，重新组装(s19)。
 
+        # ── 阶段5: 调 LLM(带错误恢复 s11) ──
         try:
             response = call_llm(messages, context, tools, state, max_tokens)
         except Exception as e:
+            # Path 2: prompt_too_long → reactive compact(once)
             if is_prompt_too_long_error(e) and not state.has_attempted_reactive_compact:
                 messages[:] = reactive_compact(messages)
                 state.has_attempted_reactive_compact = True
                 continue
+                # ↑ 紧急压缩(s08/s11)，重试。
             messages.append({"role": "assistant", "content": [
                 {"type": "text", "text": f"[Error] {type(e).__name__}: {e}"}]})
             return
 
+        # ── 阶段6: Path 1 max_tokens → 升级或续写(s11) ──
         if response.stop_reason == "max_tokens":
             if not state.has_escalated:
+                # ↑ 第一次截断: 升级 8K→64K(详见 s11)。
                 max_tokens = ESCALATED_MAX_TOKENS
                 state.has_escalated = True
                 print(f"  \033[33m[max_tokens] retry with {max_tokens}\033[0m")
                 continue
             messages.append({"role": "assistant", "content": response.content})
             if state.recovery_count < MAX_RECOVERY_RETRIES:
+                # ↑ 升级后还截断: 续写提示(s11)。
                 messages.append({"role": "user", "content": CONTINUATION_PROMPT})
                 state.recovery_count += 1
                 continue
             return
 
+        # ── 正常完成: 重置 + 保存回复 ──
         max_tokens = DEFAULT_MAX_TOKENS
         state.has_escalated = False
         messages.append({"role": "assistant", "content": response.content})
         if not has_tool_use(response.content):
             trigger_hooks("Stop", messages)
+            # ↑ Stop hook(s04): 循环退出前触发(收尾统计)。trigger_hooks 详见 s04。
             return
 
+        # ── 阶段7: 工具执行(hooks + 后台 + 动态分发) ──
         results = []
         compacted_now = False
         for block in response.content:
@@ -2017,13 +2071,16 @@ def agent_loop(messages: list, context: dict):
             print(f"\033[36m> {block.name}\033[0m")
 
             if block.name == "compact":
+                # ↑ compact 工具(s08): 模型主动要求压缩。
                 messages[:] = compact_history(messages)
                 messages.append({"role": "user",
                                  "content": "[Compacted. Continue with summarized context.]"})
                 compacted_now = True
                 break
+                # ↑ break 跳出 for(压缩后用新历史重新调 API)。
 
             blocked = trigger_hooks("PreToolUse", block)
+            # ↑ PreToolUse hook(s04): 权限检查。
             if blocked:
                 results.append({"type": "tool_result",
                                 "tool_use_id": block.id,
@@ -2031,6 +2088,7 @@ def agent_loop(messages: list, context: dict):
                 continue
 
             if should_run_background(block.name, block.input):
+                # ↑ 后台判断(s13): 慢操作丢后台。
                 bg_id = start_background_task(block, handlers)
                 output = (f"[Background task {bg_id} started] "
                           "Result will arrive as a task_notification.")
@@ -2040,12 +2098,14 @@ def agent_loop(messages: list, context: dict):
                 continue
 
             handler = handlers.get(block.name)
+            # ↑ ★ 从动态 handlers 查(s19，可能是内置或 mcp__xxx)。
             output = call_tool_handler(handler, block.input, block.name)
             trigger_hooks("PostToolUse", block, output)
-            print(str(output)[:300])
+            # ↑ PostToolUse hook(s04): 执行后副作用。
 
             if block.name == "todo_write":
                 rounds_since_todo = 0
+                # ↑ todo 更新了重置计数(s05)。
             else:
                 rounds_since_todo += 1
 
@@ -2054,8 +2114,12 @@ def agent_loop(messages: list, context: dict):
 
         if compacted_now:
             continue
+            # ↑ compact 被调用 → 不喂 results，直接回 while 顶部。
 
+        # ── 阶段8: 合并喂回(s13) ──
         messages.append({"role": "user", "content": build_user_content(results)})
+        # ↑ ★ 工具结果 + 后台通知合并成一条 user 消息(build_user_content 见上方)。
+        # 循环回到顶部，带着新历史再问模型。
 
 
 def print_turn_assistants(messages: list, turn_start: int):

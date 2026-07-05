@@ -655,66 +655,94 @@ def run_review_plan(request_id: str, approve: bool,
     return f"Plan {'approved' if approve else 'rejected'}"
 
 
-# ── MCP System (s19 new) ──
+# ═══════════════════════════════════════════════════════════
+#  NEW in s19: MCP System — 外部工具接入(Model Context Protocol)
+#  ★ 内置工具(bash/read/...)写死在代码里。MCP 让 agent 运行时连接外部工具服务器
+#    (如文档搜索/部署系统)，把外部工具和内置工具合并成一个统一池。
+#  ★ 核心流程: connect_mcp("docs") → 发现工具 → assemble_tool_pool 合并
+#    → 模型调 mcp__docs__search → 路由到 docs 服务器的 search 工具。
+#  ★ AGENTS.md 提醒: 教学版是 mock(假服务器)，不连真实 MCP 传输/OAuth。
+# ═══════════════════════════════════════════════════════════
 
 class MCPClient:
+    # ★★★ s19 核心新增: MCP 客户端。连接一个 MCP 服务器，发现并调用它的工具。
+    #   ★ 教学版是 mock: 不连真实传输(JSON-RPC/OAuth)，用预注册的工具模拟。
     """Discovers and calls tools on an MCP server (mock for teaching)."""
 
     def __init__(self, name: str):
+        # ↑ __init__ 构造函数(详见 s11)。self 详见 s11。
         self.name = name
         self.tools: list[dict] = []
+        # ↑ 工具声明列表(同 TOOLS 格式: name/description/inputSchema)。
         self._handlers: dict[str, callable] = {}
+        # ↑ 工具处理函数表: 工具名 → 函数。callable 是"可调用对象"类型(函数)。
 
     def register(self, tool_defs: list[dict],
                  handlers: dict[str, callable]):
+        # ↑ 注册工具: 塞进 tools 和 _handlers。
         self.tools = tool_defs
         self._handlers = handlers
 
     def call_tool(self, tool_name: str, args: dict) -> str:
+        # ★ 调用一个 MCP 工具。
         handler = self._handlers.get(tool_name)
+        # ↑ 查处理函数。dict.get 详见 s02。
         if not handler:
             return f"MCP error: unknown tool '{tool_name}'"
         try:
             return handler(**args)
+            # ↑ **args 解包: 字典展开成关键字参数(详见 s02)。
         except Exception as e:
             return f"MCP error: {e}"
 
 
 mcp_clients: dict[str, MCPClient] = {}
+# ↑ ★ 所有已连接的 MCP 服务器: 服务器名 → 客户端对象。
 
 _DISALLOWED_CHARS = re.compile(r'[^a-zA-Z0-9_-]')
+# ↑ ★ 预编译正则: [^...] 是取反(匹配"非这些字符"的字符)。
+#   这里匹配"非字母数字下划线连字符"的字符(用于替换成下划线)。re.compile 详见 s18。
 
 
 def normalize_mcp_name(name: str) -> str:
+    # ★ 规范化名字: 把非法字符替换成下划线(因为 MCP 工具要拼进工具名 mcp__server__tool)。
     """Replace non [a-zA-Z0-9_-] with underscore."""
     return _DISALLOWED_CHARS.sub('_', name)
+    # ↑ .sub(替换, 字符串): 正则替换。把所有匹配的字符替换成 '_'。
+    #   如 "my tool!" → "my_tool_"。.sub 是正则方法(re 详见 s09)。
 
 
 def _mock_server_docs():
+    # ★ Mock MCP 服务器1: 文档搜索。模拟"连接 docs 服务器后能搜文档"。
     client = MCPClient("docs")
     client.register(
         tool_defs=[
             {"name": "search", "description": "Search documentation. (readOnly)",
+             # ↑ (readOnly) 注解: 告诉模型这个工具只读(可安全并发)。详见 s19 笔记。
              "inputSchema": {"type": "object",
                              "properties": {"query": {"type": "string"}},
                              "required": ["query"]}},
+             # ↑ ★ 注意: MCP 用 inputSchema(驼峰)，Anthropic API 用 input_schema(下划线)。
+             #   assemble_tool_pool 时要转换(见下方)。
             {"name": "get_version", "description": "Get API version. (readOnly)",
-             "inputSchema": {"type": "object", "properties": {},
-                             "required": []}},
+             "inputSchema": {"type": "object", "properties": {}, "required": []}},
         ],
         handlers={
             "search": lambda query: f"[docs] Found 3 results for '{query}'",
             "get_version": lambda: "[docs] API v2.1.0",
+            # ↑ lambda: 无参匿名函数。get_version 不需要参数。
         })
     return client
 
 
 def _mock_server_deploy():
+    # ★ Mock MCP 服务器2: 部署服务。模拟"连接 deploy 服务器后能触发部署"。
     client = MCPClient("deploy")
     client.register(
         tool_defs=[
             {"name": "trigger",
              "description": "Trigger a deployment. (destructive — requires approval in real CC)",
+             # ↑ (destructive) 注解: 破坏性操作，真实 CC 要审批。
              "inputSchema": {"type": "object",
                              "properties": {"service": {"type": "string"}},
                              "required": ["service"]}},
@@ -734,39 +762,61 @@ MOCK_SERVERS = {
     "docs": _mock_server_docs,
     "deploy": _mock_server_deploy,
 }
+# ↑ 服务器名 → 工厂函数(创建客户端)。模拟"有哪些 MCP 服务器可连"。
 
 
 def connect_mcp(name: str) -> str:
+    # ★★★ s19 核心: 连接一个 MCP 服务器(发现它的工具)。
     if name in mcp_clients:
         return f"MCP server '{name}' already connected"
     factory = MOCK_SERVERS.get(name)
+    # ↑ 从注册表找工厂函数(dict.get 详见 s02)。
     if not factory:
         available = ", ".join(MOCK_SERVERS.keys())
         return f"Unknown server '{name}'. Available: {available}"
     mcp_client = factory()
+    # ↑ 调工厂函数创建客户端(模拟"连接")。
     mcp_clients[name] = mcp_client
     tool_names = [t["name"] for t in mcp_client.tools]
+    # ↑ 列表推导: 取每个工具的 name(详见 s05)。
     print(f"  \033[31m[mcp] connected: {name} → {tool_names}\033[0m")
     return (f"Connected to MCP server '{name}'. "
             f"Discovered {len(mcp_client.tools)} tools: {', '.join(tool_names)}")
 
 
 def assemble_tool_pool() -> tuple[list[dict], dict]:
+    # ★★★★ s19 灵魂: 把内置工具 + 所有 MCP 工具合并成一个统一的工具池。
+    #   返回 (工具声明列表, 处理函数映射)。tuple[list, dict] = 列表+字典的元组。
     """Assemble builtin tools + all MCP tools into one pool."""
     tools = list(BUILTIN_TOOLS)
+    # ↑ BUILTIN_TOOLS: 内置工具(bash/read/.../worktree)。list(...) 复制一份(详见 s08)。
     handlers = dict(BUILTIN_HANDLERS)
+    # ↑ dict(...): 复制一份(避免改原字典)。
     for server_name, mcp_client in mcp_clients.items():
+        # ↑ 遍历所有已连接的 MCP 服务器。dict.items() 详见 s05。
         safe_server = normalize_mcp_name(server_name)
+        # ↑ 服务器名规范化(防特殊字符)。
         for tool_def in mcp_client.tools:
             safe_tool = normalize_mcp_name(tool_def["name"])
             prefixed = f"mcp__{safe_server}__{safe_tool}"
+            # ★ 命名约定: mcp__{服务器}__{工具}。双下划线分隔，mcp__ 前缀标识外部工具。
             tools.append({
                 "name": prefixed,
                 "description": tool_def.get("description", ""),
                 "input_schema": tool_def.get("inputSchema", {}),
+                # ★ 字段名转换: MCP 用 inputSchema(驼峰) → Anthropic API 用 input_schema(下划线)。
             })
             handlers[prefixed] = (
                 lambda *, c=mcp_client, t=tool_def["name"], **kw: c.call_tool(t, kw))
+            # ★★★★ 这个 lambda 极其精妙，详细拆解:
+            #   lambda *, c=mcp_client, t=tool_def["name"], **kw: c.call_tool(t, kw)
+            #   1) * : 星号单独用，表示"后面的参数必须是关键字参数"(强制关键字)。
+            #   2) c=mcp_client, t=tool_def["name"]: 默认参数【冻结】当前循环的值!
+            #      ★ 和 s11 的 lambda 技巧同理——防"循环里所有 lambda 共享最后值"的闭包陷阱。
+            #      不用默认参数的话，所有 handler 的 c/t 都会指向循环最后的值。
+            #   3) **kw: 接收模型传的参数(解包成字典)。
+            #   4) c.call_tool(t, kw): 调用对应 MCP 客户端的工具。
+            #   效果: 模型调 "mcp__docs__search" → 这个 handler → docs 客户端.call_tool("search", 参数)。
     return tools, handlers
 
 

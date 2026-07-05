@@ -145,88 +145,137 @@ def complete_task(task_id: str) -> str:
     return msg
 
 
-# ── Worktree System (s18 new) ──
+# ═══════════════════════════════════════════════════════════
+#  NEW in s18: Worktree System — git worktree 隔离
+#  ★ 多 teammate 并行改代码会互相踩(同一目录)。s18 用 git worktree 给每个
+#    任务一个独立工作目录(独立分支)，互不干扰。做完合并/丢弃。
+#  ★ 核心操作: create_worktree(git worktree add -b 新分支)
+#    → remove_worktree(检查未提交改动 → 删除)
+#    → keep_worktree(保留待审查)
+#  ★ 安全: validate_worktree_name 防路径遍历(../../etc)。
+# ═══════════════════════════════════════════════════════════
 
 WORKTREES_DIR = WORKDIR / ".worktrees"
+# ↑ worktree 存放目录。
 WORKTREES_DIR.mkdir(exist_ok=True)
 
 VALID_WT_NAME = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
+# ↑ ★ 预编译正则: 只允许字母/数字/点/下划线/连字符，长度1-64。
+#   re.compile(模式): 预编译正则(只编译一次，复用更快)。详见 s09 的 re。
+#   ^...$: ^匹配开头，$匹配结尾(整个字符串必须完全匹配，不能有额外字符)。
+#   [A-Za-z0-9._-]: 字符集，匹配这些字符中的任一个。
+#   {1,64}: 重复1到64次。
+#   作用: 防止 "../../etc/passwd" 这类路径遍历攻击。
 
 
 def validate_worktree_name(name: str) -> str | None:
+    # ★ 校验 worktree 名字是否安全。返回错误信息或 None(合法)。
     """Return error message if invalid, None if valid."""
     if not name:
         return "Worktree name cannot be empty"
     if name == "." or name == "..":
         return f"'{name}' is not a valid worktree name"
+        # ↑ . 和 .. 是特殊目录名(当前/上级)，不能用。
     if not VALID_WT_NAME.match(name):
+        # ↑ ★ .match(字符串): 正则匹配。从头匹配，全匹配则返回 match 对象(真)，否则 None(假)。
         return (f"Invalid worktree name '{name}': "
                 "only letters, digits, dots, underscores, dashes (1-64 chars)")
     return None
 
 
 def run_git(args: list[str]) -> tuple[bool, str]:
+    # ★★★ s18 核心: 执行 git 命令。★ 注意: 不用 shell=True!
+    #   s01 的 run_bash 用 shell=True(通过 shell 解析命令)。这里用参数列表。
+    #   ["git"] + args: 把 "git" 和参数列表拼成完整命令。
+    #   好处: 参数不经过 shell 解析，不会被命令注入攻击(更安全)。
+    #   返回 (是否成功, 输出文本) 的元组。tuple[bool, str] = 布尔+字符串。
     """Run git command. Return (ok, output)."""
     try:
         r = subprocess.run(["git"] + args, cwd=WORKDIR,
                            capture_output=True, text=True, timeout=30)
+        # ↑ ["git"] + args: 列表拼接。如 ["git"]+["worktree","add"] = ["git","worktree","add"]。
+        #   不传 shell(默认 False): 直接执行参数列表，不经 shell。
         out = (r.stdout + r.stderr).strip()
         out = out[:5000] if out else "(no output)"
         return r.returncode == 0, out
+        # ↑ r.returncode: 命令退出码(0=成功，非0=失败)。== 0 判断是否成功。
     except subprocess.TimeoutExpired:
         return False, "Error: git timeout"
 
 
 def log_event(event_type: str, worktree_name: str, task_id: str = ""):
+    # ★ s18 新增: 记录 worktree 生命周期事件到 events.jsonl(审计日志)。
     """Append a lifecycle event to events.jsonl."""
     event = {"type": event_type, "worktree": worktree_name,
              "task_id": task_id, "ts": time.time()}
     events_file = WORKTREES_DIR / "events.jsonl"
     with open(events_file, "a") as f:
+        # ↑ open(..., "a"): 追加模式(详见 s15)。
         f.write(json.dumps(event) + "\n")
+        # ↑ 写一行 JSON + 换行(JSONL 格式)。
 
 
 def create_worktree(name: str, task_id: str = "") -> str:
+    # ★★★ s18 核心: 创建 git worktree(独立工作目录 + 专用分支)。
+    #   git worktree add: 在另一个目录创建工作树(共享 .git，但有独立工作区)。
+    #   -b wt/名字: 创建新分支 wt/名字(以 wt/ 前缀标识 worktree 分支)。
     """Create a git worktree with a dedicated branch. Optionally bind to a task."""
     err = validate_worktree_name(name)
     if err:
         return f"Error: {err}"
+        # ↑ 名字不合法 → 拒绝(防路径遍历)。
     path = WORKTREES_DIR / name
     if path.exists():
         return f"Worktree '{name}' already exists at {path}"
+        # ↑ 已存在 → 拒绝(防覆盖)。
     ok, result = run_git(["worktree", "add", str(path), "-b", f"wt/{name}", "HEAD"])
+    # ↑ ★ git worktree add <路径> -b <分支名> <起点>:
+    #   在 path 创建工作树，新建分支 wt/name，从 HEAD(当前提交)开始。
     if not ok:
         return f"Git error: {result}"
     if task_id:
         bind_task_to_worktree(task_id, name)
+        # ↑ 有 task_id → 把 worktree 绑定到任务(Task 加 worktree 字段)。
     log_event("create", name, task_id)
     print(f"  \033[33m[worktree] created: {name} at {path}\033[0m")
     return f"Worktree '{name}' created at {path}"
 
 
 def bind_task_to_worktree(task_id: str, worktree_name: str):
+    # ★ s18 新增: 把 worktree 绑定到任务(Task 加 worktree 字段)。
     """Write worktree field to task. Keep status as pending for auto-claim."""
     task = load_task(task_id)
     task.worktree = worktree_name
+    # ↑ ★ s18 的 Task dataclass 比 s12 多了 worktree 字段(见文件开头)。
     save_task(task)
     print(f"  \033[33m[bind] {task.subject} → worktree:{worktree_name}\033[0m")
 
 
 def _count_worktree_changes(path: Path) -> tuple[int, int]:
+    # ★ s18 辅助: 统计 worktree 里的未提交文件数 + 未推送提交数。
+    #   用于 remove 前的安全检查(防止误删有改动的 worktree)。
     """Count uncommitted files and commits in a worktree."""
     try:
         r1 = subprocess.run(["git", "status", "--porcelain"],
                             cwd=path, capture_output=True, text=True, timeout=10)
+        # ↑ git status --porcelain: 机器友好的状态输出(每行一个改动文件)。
+        #   --porcelain 格式稳定(不受配置影响)，适合程序解析。
         files = len([l for l in r1.stdout.strip().splitlines() if l.strip()])
+        # ↑ 列表推导: 统计非空行数 = 改动文件数。l 是行变量(避免和 1 混淆用 l)。
         r2 = subprocess.run(["git", "log", "@{push}..HEAD", "--oneline"],
                             cwd=path, capture_output=True, text=True, timeout=10)
+        # ↑ git log @{push}..HEAD: 显示已推送后到 HEAD 之间的提交(未推送的)。
+        #   --oneline: 每行一个提交。
         commits = len([l for l in r2.stdout.strip().splitlines() if l.strip()])
         return files, commits
+        # ↑ 返回 (文件数, 提交数)。
     except Exception:
         return -1, -1
+        # ↑ 出错返回 -1(上层据此判断"无法验证")。
 
 
 def remove_worktree(name: str, discard_changes: bool = False) -> str:
+    # ★★★ s18 核心: 删除 worktree。★ 防御性: 有未提交改动时拒绝删除(除非 discard_changes)。
     """Remove worktree. Refuses if uncommitted changes unless discard_changes."""
     err = validate_worktree_name(name)
     if err:
@@ -235,25 +284,32 @@ def remove_worktree(name: str, discard_changes: bool = False) -> str:
     if not path.exists():
         return f"Worktree '{name}' not found"
     if not discard_changes:
+        # ★ 安全检查: 没要求丢弃改动 → 先检查有没有未提交的内容。
         files, commits = _count_worktree_changes(path)
         if files < 0:
             return (f"Cannot verify worktree '{name}' status. "
                     "Use discard_changes=true to force removal.")
+            # ↑ 无法验证状态 → 拒绝(宁可保守)。
         if files > 0 or commits > 0:
             return (f"Worktree '{name}' has {files} uncommitted file(s) "
                     f"and {commits} unpushed commit(s). "
                     "Use discard_changes=true to force removal, "
                     "or keep_worktree to preserve for review.")
+            # ★ 有改动 → 拒绝删除，提示用 discard_changes=true 强制删 或 keep_worktree 保留。
     ok1, _ = run_git(["worktree", "remove", str(path), "--force"])
+    # ↑ git worktree remove --force: 删除工作树目录(--force 忽略改动)。
     if not ok1:
         return f"Failed to remove worktree directory for '{name}'"
     run_git(["branch", "-D", f"wt/{name}"])
+    # ↑ git branch -D: 强制删除分支(-D = --delete --force)。
     log_event("remove", name)
     print(f"  \033[33m[worktree] removed: {name}\033[0m")
     return f"Worktree '{name}' removed"
+    # ★ 注意: remove 不自动完成任务(状态不变)。任务完成要单独调 complete_task。
 
 
 def keep_worktree(name: str) -> str:
+    # ★ s18 新增: 保留 worktree(不删，供人工审查)。分支保留。
     """Keep worktree for manual review. Branch preserved."""
     err = validate_worktree_name(name)
     if err:

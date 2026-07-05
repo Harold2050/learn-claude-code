@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ↑ shebang 行，详见 s01 注释。
 """
 s15: Agent Teams — MessageBus + spawn_teammate_thread + inbox injection.
 
@@ -19,8 +20,18 @@ ASCII flow:
                 └── inbox ← MessageBus ← teammate.send_message ←┘
   Teammate: inbox → LLM → bash/read/write/send → loop (max 10 turns)
 """
+# ↑ 模块 docstring，详见 s01 注释。
+#   本文件核心: 多 agent 协作(团队)。
+#   前面 s06 的子代理是"一次性"的(派出去干完就消失)。
+#   s15 的 teammate 是"持续存在"的——通过邮箱(MessageBus)互相发消息协作。
+#   Lead(主代理)可以 spawn 多个 teammate，它们并行干活，结果通过邮箱回传。
 
 import os, subprocess, json, time, random, threading, queue
+# ↑ 标准库导入。
+#   ★ queue: s15 新增。queue.Queue 是线程安全队列。
+#     Queue.put(item): 放入元素(线程安全)。
+#     Queue.get(): 取出元素(阻塞直到有元素)。
+#     用于 input_reader 和 inbox_poller 两个线程把事件喂给主循环。
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, asdict
@@ -30,21 +41,26 @@ try:
     readline.parse_and_bind('set bind-tty-special-chars off')
 except ImportError:
     pass
+# ↑ readline 中文输入修复，详见 s01 注释。
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
+# ↑ SDK 和 dotenv，详见 s01 注释。
 
 load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+# ↑ 加载 .env、兼容第三方端点，详见 s01 注释。
 
 WORKDIR = Path.cwd()
 MEMORY_DIR = WORKDIR / ".memory"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
+# ↑ 工作目录、记忆、客户端、模型(继承 s05/s10)。
 
 # ── Task System (from s12, synced) ──
+# ↓ 任务系统(继承 s12 完整复制)。逐行注释见 s12。
 
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
@@ -141,6 +157,7 @@ def complete_task(task_id: str) -> str:
 # ── Prompt Assembly (from s10, synced) ──
 
 PROMPT_SECTIONS = {
+    # ↑ 提示片段(继承 s10)。tools 段加了团队工具。
     "identity": "You are a coding agent. Act, don't explain.",
     "tools": "Available tools: bash, read_file, write_file, "
              "get_task, create_task, list_tasks, claim_task, complete_task, "
@@ -184,7 +201,6 @@ def safe_path(p: str) -> Path:
 
 
 def run_bash(command: str, run_in_background: bool = False) -> str:
-    # run_in_background is handled by agent_loop dispatch, not here
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
                            capture_output=True, text=True, timeout=120)
@@ -215,6 +231,7 @@ def run_write(path: str, content: str) -> str:
 
 
 # Task tools
+# ↓ 5 个任务工具(继承 s12)。逐行注释见 s12。
 
 def run_create_task(subject: str, description: str = "",
                     blockedBy: list[str] | None = None) -> str:
@@ -255,6 +272,7 @@ def run_complete_task(task_id: str) -> str:
 
 
 # ── Background Tasks (from s13, synced) ──
+# ↓ 后台任务(继承 s13 完整复制)。逐行注释见 s13。
 
 _bg_counter = 0
 background_tasks: dict[str, dict] = {}
@@ -281,6 +299,7 @@ def should_run_background(tool_name: str, tool_input: dict) -> bool:
 
 
 def execute_tool(block) -> str:
+    # ↑ 统一执行(继承 s13)。handlers 字典加了团队工具(见下)。
     """Execute a tool call block, return output."""
     handler = {
         "bash": run_bash, "read_file": run_read, "write_file": run_write,
@@ -291,6 +310,7 @@ def execute_tool(block) -> str:
         "cancel_cron": run_cancel_cron,
         "spawn_teammate": run_spawn_teammate,
         "send_message": run_send_message, "check_inbox": run_check_inbox,
+        # ↑ ★ 新增团队工具映射(这些函数在后面定义)。
     }.get(block.name)
     if handler:
         return handler(**block.input)
@@ -345,13 +365,17 @@ def collect_background_results() -> list[str]:
 
 
 def has_pending_background() -> bool:
+    # ★ s15 新增: 非破坏性检查(是否有已完成待收集的后台任务)。
+    #   inbox_poller 用它判断是否该唤醒 Lead。
     """Non-destructive: True if any background task has completed and is
     waiting to be collected. The inbox poller uses this in its wake condition."""
     with background_lock:
         return any(t["status"] == "completed" for t in background_tasks.values())
+        # ↑ any(生成器): 任一后台任务状态是 completed 就返回 True。
 
 
 # ── Cron Scheduler (from s14, synced) ──
+# ↓ cron 调度器(继承 s14 完整复制)。逐行注释见 s14。
 
 DURABLE_PATH = WORKDIR / ".scheduled_tasks.json"
 
@@ -402,10 +426,8 @@ def cron_matches(cron_expr: str, dt: datetime) -> bool:
     month_ok = _cron_field_matches(month, dt.month)
     dow_ok = _cron_field_matches(dow, dow_val)
 
-    # Minute, hour, month must all match
     if not (m and h and month_ok):
         return False
-    # DOM and DOW: if both constrained, either matching is enough (OR)
     dom_unconstrained = dom == "*"
     dow_unconstrained = dow == "*"
     if dom_unconstrained and dow_unconstrained:
@@ -524,13 +546,10 @@ def cancel_job(job_id: str) -> str:
 
 
 def cron_scheduler_loop():
-    """Independent daemon thread: poll every 1s, fire matching jobs.
-    Individual job errors are caught to prevent one bad job from
-    killing the entire scheduler thread."""
+    """Independent daemon thread: poll every 1s, fire matching jobs."""
     while True:
         time.sleep(1)
         now = datetime.now()
-        # Date-aware marker prevents daily jobs from skipping on day 2+
         minute_marker = now.strftime("%Y-%m-%d %H:%M")
         with cron_lock:
             for job in list(scheduled_jobs.values()):
@@ -564,6 +583,7 @@ print("  \033[35m[cron] scheduler thread started\033[0m")
 
 
 # Cron tool handlers
+# ↓ 3 个 cron 工具(继承 s14)。逐行注释见 s14。
 
 def run_schedule_cron(cron: str, prompt: str,
                       recurring: bool = True, durable: bool = True) -> str:
@@ -591,69 +611,106 @@ def run_cancel_cron(job_id: str) -> str:
     return cancel_job(job_id)
 
 
-# ── MessageBus (s15 new) ──
-# Teaching version uses simple file append + unlink.
-# Real CC uses proper-lockfile for concurrent write safety.
+# ═══════════════════════════════════════════════════════════
+#  MessageBus (s15 new)
+# ═══════════════════════════════════════════════════════════
+# 教学版用简单的文件追加 + 删除。
+# 真实 CC 用 proper-lockfile 保证并发写安全。
+# ↑ AGENTS.md 提到的简化: 没有文件锁。详见"看似 bug 的简化"。
 
 MAILBOX_DIR = WORKDIR / ".mailboxes"
+# ↑ ★ s15 新增: 邮箱目录。每个 agent 一个 .jsonl 文件(如 lead.jsonl)。
 MAILBOX_DIR.mkdir(exist_ok=True)
 
 
 class MessageBus:
+    # ★★★★ s15 核心新增: 基于文件的消息总线。
+    #   每个 agent 有个邮箱文件(.mailboxes/名字.jsonl)。
+    #   发消息 = 往对方邮箱追加一行 JSON。
+    #   读消息 = 读全部 + 删文件(读即销毁，防重复处理)。
     """File-based message bus. Each agent has a .jsonl inbox.
     Read is destructive: read_text + unlink (consumes messages).
     Teaching version: no file locking; real CC uses proper-lockfile."""
 
     def send(self, from_agent: str, to_agent: str, content: str,
              msg_type: str = "message"):
+        # ★ 发消息: 往 to_agent 的邮箱追加一条 JSON。
         msg = {"from": from_agent, "to": to_agent,
                "content": content, "type": msg_type,
                "ts": time.time()}
+        # ↑ 消息字典: 发件人/收件人/内容/类型/时间戳。
         inbox = MAILBOX_DIR / f"{to_agent}.jsonl"
         with open(inbox, "a") as f:
+            # ↑ ★ open(文件, "a"): 以追加模式打开("a"=append)。
+            #   追加模式: 写的内容加到文件末尾(不覆盖)。
+            #   with open(...) as f: 上下文管理器，自动关闭。详见 s08。
             f.write(json.dumps(msg) + "\n")
+            # ↑ 写一行 JSON + 换行(JSONL 格式，每行一条)。
         print(f"  \033[33m[bus] {from_agent} → {to_agent}: "
               f"{content[:50]}\033[0m")
 
     def read_inbox(self, agent: str) -> list[dict]:
+        # ★★★ 读消息: 读全部 + 删文件(读即销毁)。
         inbox = MAILBOX_DIR / f"{agent}.jsonl"
         if not inbox.exists():
             return []
+            # ↑ 没邮箱文件 = 没消息。
         msgs = [json.loads(line) for line in inbox.read_text().splitlines()
                 if line.strip()]
+        # ↑ 读全文→按行分割→每行解析成字典。
+        #   splitlines(): 按换行分割成行列表。详见 s02。
+        #   if line.strip(): 跳过空行(.strip() 为空是假)。
         inbox.unlink()  # consume: read + delete
+        # ↑ ★ unlink(): 删除文件(Path 方法)。
+        #   读即销毁: 读完后删邮箱，防止下次重复读。
         return msgs
 
     def peek(self, agent: str) -> bool:
+        # ★ s15 新增: 非破坏性检查(邮箱是否有未读)。
+        #   inbox_poller 用它判断是否该唤醒 Lead(不消费消息)。
         """Non-destructive: True if the agent has unread inbox messages.
         The Lead's inbox poller uses this to decide whether to wake a turn
         without consuming the mailbox."""
         inbox = MAILBOX_DIR / f"{agent}.jsonl"
         return inbox.exists() and inbox.stat().st_size > 0
+        # ↑ ★ inbox.stat(): 文件状态对象。.st_size: 文件大小(字节)。
+        #   文件存在且大小>0 → 有未读。
 
 
 BUS = MessageBus()
+# ↑ ★ 全局消息总线实例。所有 agent 共用这一个。
 
 # Track spawned teammates
 active_teammates: dict[str, bool] = {}
+# ↑ ★ 已派生的 teammate 注册表: 名字 → True(存在)。teammate 完成后删除。
 
 
-# ── Teammate Thread (s15 new) ──
+# ═══════════════════════════════════════════════════════════
+#  Teammate Thread (s15 new)
+# ═══════════════════════════════════════════════════════════
 
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
+    # ★★★★★ s15 核心: 在后台线程派生一个 teammate。
+    #   teammate 是个简化版 agent(只有 bash/read/write/send_message)。
+    #   最多跑10轮，完成后把摘要发回 Lead 邮箱。
+    #   ★ 教学版硬上限10轮(真实CC用idle循环)。
     """Spawn a teammate agent in a background thread.
     Teaching version: max 10 rounds per teammate.
     Real CC: teammates use idle loop (wait for inbox, work, repeat)
     until shutdown_request."""
     if name in active_teammates:
         return f"Teammate '{name}' already exists"
+        # ↑ 同名 teammate 已存在，拒绝重复派生。
 
     system = (f"You are '{name}', a {role}. "
               f"Use tools to complete tasks. "
               f"Send results via send_message to 'lead'.")
+    # ↑ teammate 专属系统提示: 告诉它身份 + 用 send_message 向 lead 汇报。
 
     def run():
+        # ★ teammate 线程的主函数(闭包捕获 name/role/prompt/system)。
         messages = [{"role": "user", "content": prompt}]
+        # ↑ teammate 自己的消息历史(全新，和 Lead 隔离)。
         sub_tools = [
             {"name": "bash", "description": "Run a shell command.",
              "input_schema": {"type": "object",
@@ -675,26 +732,41 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                                              "content": {"type": "string"}},
                               "required": ["to", "content"]}},
         ]
+        # ↑ teammate 的工具集(只有4个基础工具，没有 spawn_teammate 防递归)。
         sub_handlers = {
             "bash": run_bash, "read_file": run_read, "write_file": run_write,
             "send_message": lambda to, content: (BUS.send(name, to, content),
                                                   "Sent")[1],
+            # ↑ ★★★ 这个 lambda 很巧妙，详细拆解:
+            #   lambda to, content: (BUS.send(...), "Sent")[1]
+            #   1) BUS.send(name, to, content): 发消息(返回 None，因为 send 没 return)。
+            #   2) (None, "Sent"): 逗号构造元组(两元素)。
+            #   3) [1]: 取元组第二个元素 "Sent"。
+            #   整体效果: 发消息 + 返回 "Sent" 字符串。
+            #   为什么这么做? lambda 只能写一个表达式，用元组 trick 在一个表达式里
+            #   同时"执行副作用(发消息) + 返回值(Sent)"。
         }
 
         for _ in range(10):
+            # ↑ ★ 教学版硬上限10轮(防 teammate 无限跑)。真实CC用idle循环。
             inbox = BUS.read_inbox(name)
+            # ↑ 每轮先读自己邮箱(看 Lead 有没有新指令)。
             if inbox:
                 messages.append({"role": "user",
                                  "content": f"<inbox>{json.dumps(inbox)}</inbox>"})
+                # ↑ 有消息就注入(<inbox>标签包裹，让模型识别)。
             try:
                 response = client.messages.create(
                     model=MODEL, system=system, messages=messages[-20:],
+                    # ↑ ★ messages[-20:]: 只取最近20条(防止 teammate 历史过长)。
                     tools=sub_tools, max_tokens=8000)
             except Exception:
                 break
+                # ↑ API 错误就停止 teammate(简化处理)。
             messages.append({"role": "assistant", "content": response.content})
             if response.stop_reason != "tool_use":
                 break
+                # ↑ 不调工具(任务完成)就停。
             results = []
             for block in response.content:
                 if block.type == "tool_use":
@@ -708,25 +780,34 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         # Send final summary to Lead
         summary = "Done."
         for msg in reversed(messages):
+            # ↑ 反向遍历(从最后往前找 assistant 文字)。
             if msg["role"] == "assistant" and isinstance(msg["content"], list):
                 for b in msg["content"]:
-                    if getattr(b, "type", None) == "text":
+                    if getattr(b, "text", None) == "text":
                         summary = b.text
                         break
                 else:
                     continue
-                break
+                    # ↑ ★ for...else: else 在 for【正常结束】(没 break)时执行。
+                    #   内层 for 没 break(没找到 text 块)→ continue 外层循环。
+                    #   找到了(break)→ 跳过 else，break 外层。
+                    break
         BUS.send(name, "lead", summary, "result")
+        # ↑ ★ teammate 完成后把摘要发回 Lead 邮箱(类型 "result")。
         active_teammates.pop(name, None)
+        # ↑ 从注册表删除(标记完成)。
         print(f"  \033[32m[teammate] {name} finished\033[0m")
 
     active_teammates[name] = True
+    # ↑ 注册 teammate。
     threading.Thread(target=run, daemon=True).start()
+    # ↑ ★ 启动 teammate 线程(后台执行 run 函数)。
     print(f"  \033[36m[teammate] {name} spawned as {role}\033[0m")
     return f"Teammate '{name}' spawned as {role}"
 
 
 # ── Team Tool Handlers (s15 new) ──
+# ↓ 3 个团队工具(Lead 专用)。
 
 def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
     return spawn_teammate_thread(name, role, prompt)
@@ -734,11 +815,13 @@ def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
 
 def run_send_message(to: str, content: str) -> str:
     BUS.send("lead", to, content)
+    # ↑ Lead 发消息(发件人固定 "lead")。
     return f"Sent to {to}"
 
 
 def run_check_inbox() -> str:
     msgs = BUS.read_inbox("lead")
+    # ↑ ★ 读 Lead 邮箱(读即销毁)。
     if not msgs:
         return "(inbox empty)"
     lines = []
@@ -750,6 +833,7 @@ def run_check_inbox() -> str:
 # ── Tool Definitions ──
 
 TOOLS = [
+    # ↑ 工具声明(继承 s14 + 3个团队工具)。前11个见 s14。
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object",
                       "properties": {
@@ -817,6 +901,7 @@ TOOLS = [
                       "properties": {"job_id": {"type": "string"}},
                       "required": ["job_id"]}},
     {"name": "spawn_teammate",
+     # ↑ ★ s15 新工具: 派生 teammate。
      "description": "Spawn a teammate agent in a background thread.",
      "input_schema": {"type": "object",
                       "properties": {
@@ -825,12 +910,14 @@ TOOLS = [
                           "prompt": {"type": "string"}},
                       "required": ["name", "role", "prompt"]}},
     {"name": "send_message",
+     # ↑ ★ s15 新工具: 发消息给 teammate。
      "description": "Send a message to a teammate via MessageBus.",
      "input_schema": {"type": "object",
                       "properties": {"to": {"type": "string"},
                                      "content": {"type": "string"}},
                       "required": ["to", "content"]}},
     {"name": "check_inbox",
+     # ↑ ★ s15 新工具: 查 Lead 邮箱。
      "description": "Check Lead's inbox for teammate messages.",
      "input_schema": {"type": "object", "properties": {},
                       "required": []}},
@@ -840,6 +927,7 @@ TOOLS = [
 # ── Context ──
 
 def update_context(context: dict, messages: list) -> dict:
+    # ↑ 更新上下文(继承 s10)。逐行注释见 s10。
     """Derive context from real state."""
     memories = ""
     if MEMORY_INDEX.exists():
@@ -854,11 +942,10 @@ def update_context(context: dict, messages: list) -> dict:
 
 
 # ── Agent Loop ──
-# Teaching code keeps a basic agent loop. S11's full error recovery is omitted.
-# Cron queue is consumed when agent_loop is called; real CC auto-wakes via
-# queue processor (useQueueProcessor.ts) when items arrive.
 
 def agent_loop(messages: list, context: dict):
+    # ★ s15 agent loop(继承 s14): 消费 cron 队列 + 工具执行 + 后台通知。
+    #   团队工具(spawn_teammate/send_message/check_inbox)通过 execute_tool 自动派发。
     system = get_system_prompt(context)
     while True:
         # Consume fired cron jobs → inject as messages
@@ -896,6 +983,7 @@ def agent_loop(messages: list, context: dict):
                                            f"Result will be available when complete."})
             else:
                 output = execute_tool(block)
+                # ↑ ★ 团队工具(spawn_teammate 等)在这里通过 execute_tool 执行。
                 print(str(output)[:300])
                 results.append({"type": "tool_result",
                                 "tool_use_id": block.id,
@@ -920,18 +1008,24 @@ if __name__ == "__main__":
 
     # input() and a 1s poller (teammate inbox or background results) feed one
     # event queue (issues #291, #46).
+    # ↑ ★ s15 核心改动: 用事件队列统一处理"用户输入"和"异步结果"两种来源。
     events = queue.Queue()
+    # ↑ ★ 线程安全队列。input_reader 和 inbox_poller 两个线程往里放事件，主循环取。
 
     def input_reader():
+        # ★ 线程1: 读用户输入，放进队列。
         while True:
             try:
                 line = input("\033[36ms15 >> \033[0m")
             except (EOFError, KeyboardInterrupt):
                 events.put(("quit", None))
+                # ↑ 放退出事件。元组 ("类型", 数据)。
                 return
             events.put(("user", line))
+            # ↑ 放用户输入事件。
 
     def inbox_poller():
+        # ★ 线程2: 每秒检查邮箱/后台，有结果就放"唤醒"事件。
         # Poll ~1s and wake the Lead when async results are ready: teammate
         # inbox messages or completed background tasks. Don't gate on
         # active_teammates: a teammate sends its result and then removes itself,
@@ -939,6 +1033,7 @@ if __name__ == "__main__":
         while True:
             time.sleep(1)
             if BUS.peek("lead") or has_pending_background():
+                # ↑ ★ peek(非破坏): 邮箱有消息 或 后台有完成 → 唤醒。
                 events.put(("wake", None))
 
     threading.Thread(target=input_reader, daemon=True).start()
@@ -947,6 +1042,7 @@ if __name__ == "__main__":
     had_teammates = False
     while True:
         kind, payload = events.get()
+        # ↑ ★ events.get(): 阻塞取出事件(队列空时等待)。返回元组(类型, 数据)。
         if kind == "quit":
             break
         if kind == "user":
@@ -956,19 +1052,23 @@ if __name__ == "__main__":
         else:  # "wake": teammate inbox or background results are ready
             parts = []
             inbox = BUS.read_inbox("lead")
+            # ↑ ★ 唤醒时读 Lead 邮箱(读即销毁)。
             if inbox:
                 parts.append("[Inbox]\n" + "\n".join(
                     f"From {m['from']}: {m['content'][:200]}" for m in inbox))
+                # ↑ 格式化邮箱消息为文本(发件人 + 内容预览)。
             bg = collect_background_results()
             parts.extend(bg)
             if not parts:
                 continue  # already drained by an earlier wake (idempotent)
+                # ↑ 幂等保护: 可能被前一次唤醒取走了，没东西就跳过。
             history.append({"role": "user", "content": "\n".join(parts)})
             print(f"\n\033[33m[wake: {len(inbox)} inbox + {len(bg)} background "
                   f"-> new turn]\033[0m")
 
         # One turn for whichever source woke us.
         agent_loop(history, context)
+        # ↑ ★ 不管是用户还是唤醒，都跑一轮 agent_loop。
         context = update_context(context, history)
         for block in history[-1]["content"]:
             if getattr(block, "type", None) == "text":
@@ -979,7 +1079,10 @@ if __name__ == "__main__":
         # Announce once when every teammate has finished and its output drained.
         if active_teammates:
             had_teammates = True
+            # ↑ 记录"曾经有过 teammate"。
         elif had_teammates and not BUS.peek("lead") and not has_pending_background():
+            # ↑ ★ 所有 teammate 完成(注册表空) 且 邮箱空 且 无待收集后台 → 通知一次。
             print("\033[32m[all teammates done]\033[0m")
             had_teammates = False
+            # ↑ 重置标记(只通知一次)。
         print()

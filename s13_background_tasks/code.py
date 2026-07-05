@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ↑ shebang 行，详见 s01 注释。
 """
 s13: Background Tasks — thread-based async execution + notification injection.
 
@@ -20,31 +21,46 @@ Note: Teaching code keeps a basic agent loop to stay focused on background
 tasks. S11's full error recovery (RecoveryState, backoff, escalation,
 reactive compact, fallback model) is omitted.
 """
+# ↑ 模块 docstring，详见 s01 注释。
+#   本文件核心: 线程异步执行慢操作 + 通知注入。
+#   有些工具(npm install/docker build)要跑几分钟。同步等会卡住 agent。
+#   s13 把慢操作丢到后台线程执行，主循环立刻继续。
+#   后台完成后，用 <task_notification> XML 注入下一轮对话告诉模型结果。
 
 import os, subprocess, json, time, random, threading
+# ↑ 标准库导入。
+#   ★ threading: s13 新增。Python 的线程模块。
+#     threading.Thread(target=函数): 创建线程对象，target 是线程要跑的函数。
+#     threading.Lock(): 创建互斥锁(防止多线程同时改数据出错)。
 from pathlib import Path
 from dataclasses import dataclass, asdict
+# ↑ pathlib/dataclasses 详见 s02/s12 注释。
 
 try:
     import readline
     readline.parse_and_bind('set bind-tty-special-chars off')
 except ImportError:
     pass
+# ↑ readline 中文输入修复，详见 s01 注释。
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
+# ↑ SDK 和 dotenv，详见 s01 注释。
 
 load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+# ↑ 加载 .env、兼容第三方端点，详见 s01 注释。
 
 WORKDIR = Path.cwd()
 MEMORY_DIR = WORKDIR / ".memory"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
+# ↑ 工作目录、记忆、客户端、模型(继承 s05/s10)。
 
 # ── Task System (from s12, synced) ──
+# ↓ 任务系统(继承 s12 完整复制)。逐行注释见 s12。这里是为后台任务提供任务管理基础。
 
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
@@ -52,6 +68,7 @@ TASKS_DIR.mkdir(exist_ok=True)
 
 @dataclass
 class Task:
+    # ↑ Task 数据类(继承 s12)。逐行注释见 s12 的 Task。
     id: str
     subject: str
     description: str
@@ -141,6 +158,7 @@ def complete_task(task_id: str) -> str:
 # ── Prompt Assembly (from s10, synced) ──
 
 PROMPT_SECTIONS = {
+    # ↑ 提示片段字典(继承 s10)。逐行注释见 s10。
     "identity": "You are a coding agent. Act, don't explain.",
     "tools": "Available tools: bash, read_file, write_file, "
              "create_task, list_tasks, get_task, claim_task, complete_task.",
@@ -150,6 +168,7 @@ PROMPT_SECTIONS = {
 
 
 def assemble_system_prompt(context: dict) -> str:
+    # ↑ 组装提示(继承 s10)。逐行注释见 s10。
     sections = [PROMPT_SECTIONS["identity"],
                 PROMPT_SECTIONS["tools"],
                 PROMPT_SECTIONS["workspace"]]
@@ -163,6 +182,7 @@ _last_context_key, _last_prompt = None, None
 
 
 def get_system_prompt(context: dict) -> str:
+    # ↑ 带缓存的提示组装(继承 s10)。逐行注释见 s10。
     global _last_context_key, _last_prompt
     key = json.dumps(context, sort_keys=True, ensure_ascii=False, default=str)
     if key == _last_context_key and _last_prompt:
@@ -175,6 +195,7 @@ def get_system_prompt(context: dict) -> str:
 # ── Tools ──
 
 def safe_path(p: str) -> Path:
+    # ↑ 继承自 s02。逐行注释见 s02 的 safe_path。
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
@@ -182,6 +203,9 @@ def safe_path(p: str) -> Path:
 
 
 def run_bash(command: str, run_in_background: bool = False) -> str:
+    # ↑ ★ s13 改动: run_bash 多了个 run_in_background 参数。
+    #   但这个参数【不在这里处理】——它在 agent_loop 的分发逻辑里判断(见 should_run_background)。
+    #   这里只是为了让函数签名能接收这个参数(模型可能传它)。
     # run_in_background is handled by agent_loop dispatch, not here
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
@@ -193,6 +217,7 @@ def run_bash(command: str, run_in_background: bool = False) -> str:
 
 
 def run_read(path: str, limit: int | None = None) -> str:
+    # ↑ 继承自 s02。逐行注释见 s02 的 run_read。
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
@@ -203,6 +228,7 @@ def run_read(path: str, limit: int | None = None) -> str:
 
 
 def run_write(path: str, content: str) -> str:
+    # ↑ 继承自 s02。逐行注释见 s02 的 run_write。
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -213,6 +239,7 @@ def run_write(path: str, content: str) -> str:
 
 
 # Task tools
+# ↓ 5 个任务工具(继承 s12)。逐行注释见 s12 的对应函数。
 
 def run_create_task(subject: str, description: str = "",
                     blockedBy: list[str] | None = None) -> str:
@@ -253,6 +280,7 @@ def run_complete_task(task_id: str) -> str:
 
 
 TOOLS = [
+    # ↑ 工具声明。bash 多了 run_in_background 参数(模型可显式要求后台)。
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object",
                       "properties": {
@@ -300,6 +328,7 @@ TOOLS = [
 ]
 
 TOOL_HANDLERS = {
+    # ↑ 工具分发映射(继承 s12)。
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "create_task": run_create_task, "list_tasks": run_list_tasks,
     "get_task": run_get_task, "claim_task": run_claim_task,
@@ -307,33 +336,52 @@ TOOL_HANDLERS = {
 }
 
 
-# ── Background Tasks (s13 new) ──
+# ═══════════════════════════════════════════════════════════
+#  Background Tasks (s13 new)
+# ═══════════════════════════════════════════════════════════
 
 _bg_counter = 0
+# ★ s13 新增: 后台任务计数器(用于生成 bg_id)。
 background_tasks: dict[str, dict] = {}   # bg_id → {tool_use_id, command, status}
+# ↑ ★ 后台任务状态表: bg_id → 任务信息字典。
+#   字典类型注解 dict[str, dict] = 键字符串值字典。
 background_results: dict[str, str] = {}   # bg_id → output
+# ↑ ★ 后台任务结果表: bg_id → 输出文本。完成后填这里。
 background_lock = threading.Lock()
+# ↑ ★★★ 互斥锁。防止多个后台线程同时改 background_tasks/results 字典导致数据错乱。
+#   threading.Lock() 创建锁对象。用 with background_lock: 包住临界区(见下方)。
 
 
 def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
+    # ★ s13 新增: 启发式判断操作是否"慢"(可能超30秒)。
+    #   当模型没明确说 run_in_background 时，用这个兜底判断。
     """Fallback heuristic: commands likely to take > 30s."""
     if tool_name != "bash":
         return False
+        # ↑ 只对 bash 命令做判断(其他工具一般都快)。
     cmd = tool_input.get("command", "").lower()
     slow_keywords = ["install", "build", "test", "deploy", "compile",
                      "docker build", "pip install", "npm install",
                      "cargo build", "pytest", "make"]
+    # ↑ 慢操作关键词列表(install/build/test 等通常很慢)。
     return any(kw in cmd for kw in slow_keywords)
+    # ↑ 命令含任一关键词就判定慢。any 详见 s01。
 
 
 def should_run_background(tool_name: str, tool_input: dict) -> bool:
+    # ★★★ s13 新增: 决定操作是否该后台执行。
+    #   优先级: 模型显式要求 > 启发式判断。
     """Model explicit request takes priority; fallback to heuristic."""
     if tool_input.get("run_in_background"):
         return True
+        # ↑ ★ 模型显式传 run_in_background=True → 一定后台(尊重模型意愿)。
     return is_slow_operation(tool_name, tool_input)
+    # ↑ 否则用启发式判断(含 install/build 等关键词就后台)。
 
 
 def execute_tool(block) -> str:
+    # ★ s13 新增: 统一的工具执行函数(查表 + 调用)。
+    #   把"查 TOOL_HANDLERS + 解包参数 + 调用"封装成一处，主循环和后台线程都能用。
     """Execute a tool call block, return output."""
     handler = TOOL_HANDLERS.get(block.name)
     if handler:
@@ -342,41 +390,63 @@ def execute_tool(block) -> str:
 
 
 def start_background_task(block) -> str:
+    # ★★★ s13 核心: 在守护线程里异步执行工具。
+    #   block: 工具调用块(含 name/input/id)。
+    #   返回 bg_id(后台任务编号)。主循环不等待，立刻继续。
     """Run tool in a daemon thread. Returns background task ID."""
     global _bg_counter
+    # ↑ 声明修改全局计数器。
     _bg_counter += 1
     bg_id = f"bg_{_bg_counter:04d}"
+    # ↑ 生成 bg_id: "bg_" + 4位编号。:04d 详见 s12。
     cmd = block.input.get("command", block.name)
+    # ↑ 记录命令文本(用于通知里展示)。没有 command 参数就用工具名。
 
     def worker():
+        # ↑ ★ 内部函数: 线程要执行的实际工作。闭包捕获 bg_id 和 block。
+        #   闭包: 内部函数引用外部函数的变量(bg_id/block)。这些变量在内部函数里"活着"。
         result = execute_tool(block)
+        # ↑ 执行工具(可能很慢，但在后台线程不阻塞主循环)。
         with background_lock:
+            # ↑ ★ with 锁: 进入临界区自动加锁，离开自动释放(即使出错)。
+            #   防止多个后台线程同时改字典。
             background_tasks[bg_id]["status"] = "completed"
             background_results[bg_id] = result
+            # ↑ 标记完成 + 存结果。collect_background_results 会取走。
 
     with background_lock:
+        # ↑ 加锁注册任务(防止和 worker 同时改字典)。
         background_tasks[bg_id] = {
             "tool_use_id": block.id,
             "command": cmd,
             "status": "running",
         }
     thread = threading.Thread(target=worker, daemon=True)
+    # ↑ ★ 创建线程对象。target=worker: 线程跑 worker 函数(注意无括号，是函数本身)。
+    #   daemon=True: 守护线程——主程序退出时自动结束(不会卡住退出)。
     thread.start()
+    # ↑ ★ 启动线程(开始并行执行 worker)。start 不阻塞，立即返回。
     print(f"  \033[33m[background] dispatched {bg_id}: {cmd[:40]}\033[0m")
     return bg_id
 
 
 def collect_background_results() -> list[str]:
+    # ★★★ s13 核心: 收集已完成的后台结果，转成通知消息。
+    #   在每轮工具执行后调用，把完成的后台任务结果注入对话。
     """Collect completed background results as task_notification messages."""
     with background_lock:
         ready_ids = [bid for bid, task in background_tasks.items()
                      if task["status"] == "completed"]
+        # ↑ 列表推导: 找出所有已完成的 bg_id。加锁防并发改。
     notifications = []
     for bg_id in ready_ids:
         with background_lock:
             task = background_tasks.pop(bg_id)
+            # ↑ pop: 取出并删除(key 存在)。任务被取走(不重复通知)。
             output = background_results.pop(bg_id, "")
+            # ↑ pop(bg_id, ""): 取结果，没有返回空串(防 KeyError)。
         summary = output[:200] if len(output) > 200 else output
+        # ↑ 结果太长只取前200字符(通知是摘要，全文可让模型再查)。
         notifications.append(
             f"<task_notification>\n"
             f"  <task_id>{bg_id}</task_id>\n"
@@ -384,6 +454,8 @@ def collect_background_results() -> list[str]:
             f"  <command>{task['command']}</command>\n"
             f"  <summary>{summary}</summary>\n"
             f"</task_notification>")
+        # ↑ ★ 用 XML 格式包装通知。<task_notification> 标签让模型识别"这是后台完成通知"。
+        #   ★ 注意: 不复用原 tool_use_id——这是新通知，不是对原工具的回复。
         print(f"  \033[32m[background done] {bg_id}: "
               f"{task['command'][:40]} ({len(output)} chars)\033[0m")
     return notifications
@@ -392,6 +464,7 @@ def collect_background_results() -> list[str]:
 # ── Context ──
 
 def update_context(context: dict, messages: list) -> dict:
+    # ↑ 更新上下文(继承 s10)。逐行注释见 s10。
     """Derive context from real state."""
     memories = ""
     if MEMORY_INDEX.exists():
@@ -408,6 +481,7 @@ def update_context(context: dict, messages: list) -> dict:
 # ── Agent Loop (simplified, focused on background tasks) ──
 
 def agent_loop(messages: list, context: dict):
+    # ★ s13 agent loop: 慢操作丢后台 + 通知注入。简化错误处理(无 s11 恢复)。
     system = get_system_prompt(context)
     while True:
         try:
@@ -431,14 +505,19 @@ def agent_loop(messages: list, context: dict):
             print(f"\033[36m> {block.name}\033[0m")
 
             if should_run_background(block.name, block.input):
+                # ↑ ★★★ s13 核心改动: 工具执行前判断是否后台。
                 bg_id = start_background_task(block)
+                # ↑ 丢后台线程执行(不等待)。
                 results.append({"type": "tool_result",
                                 "tool_use_id": block.id,
                                 "content": f"[Background task {bg_id} started] "
                                            f"Command: {block.input.get('command', '')}. "
                                            f"Result will be available when complete."})
+                # ↑ ★ 立即返回"已启动"占位结果(不复用原结果，因为还没跑完)。
+                #   模型看到"后台已启动"，知道稍后会有通知。
             else:
                 output = execute_tool(block)
+                # ↑ 不后台 → 同步执行(等结果)。
                 print(str(output)[:300])
                 results.append({"type": "tool_result",
                                 "tool_use_id": block.id,
@@ -446,13 +525,17 @@ def agent_loop(messages: list, context: dict):
 
         # Inject tool results + background notifications in one user message
         user_content = list(results)
+        # ↑ 复制 results 列表(list(...) 详见 s08)。
         bg_notifications = collect_background_results()
+        # ↑ ★ 收集已完成的后台结果(转通知)。
         if bg_notifications:
             for notif in bg_notifications:
                 user_content.append({"type": "text", "text": notif})
+                # ↑ 把通知作为 text 块加进 user 消息(和 tool_result 合并成一条)。
             print(f"  \033[32m[inject] {len(bg_notifications)} background "
                   f"notification(s)\033[0m")
         messages.append({"role": "user", "content": user_content})
+        # ↑ ★ 工具结果 + 后台通知合并成一条 user 消息喂回(模型一次看到所有信息)。
         context = update_context(context, messages)
         system = get_system_prompt(context)
 
@@ -478,3 +561,4 @@ if __name__ == "__main__":
             elif isinstance(block, dict) and block.get("type") == "text":
                 print(block.get("text", ""))
         print()
+# ↑ 入口主循环(继承 s12)。详见 s10 注释。
